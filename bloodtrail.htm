@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>BuckFinders — Blood-Trail Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .leaflet-container { background:#000; }
+
+    /* HUD */
+    .hud {
+      position: fixed; inset: 10px 10px auto 10px;
+      display: grid; gap: 8px;
+      grid-template-columns: repeat(2, minmax(0,1fr));
+      z-index: 1000;
+      pointer-events: none;
+    }
+    .btn, .sel, .txt {
+      pointer-events: auto;
+      appearance: none;
+      font: 600 14px system-ui, sans-serif;
+      padding: 8px 10px;
+      border: 1px solid #444;
+      border-radius: 10px;
+      background: #111;
+      color: #eee;
+      box-shadow: 0 0 0 1px #000 inset, 0 2px 6px #0008;
+    }
+    .btn[aria-pressed="true"] { outline: 2px solid #5da9ff; }
+
+    .row { grid-column: 1 / -1; display:flex; gap:8px; flex-wrap:wrap; }
+    .stats {
+      position: fixed; left: 10px; bottom: 10px;
+      background:#111a; color:#fff; border:1px solid #444; border-radius:10px;
+      padding: 8px 10px; font: 600 13px system-ui, sans-serif; z-index:1000;
+    }
+    .bearingArrow {
+      position: fixed; right: 14px; bottom: 14px;
+      width: 64px; height: 64px; border-radius: 50%;
+      background: radial-gradient(#fffc, #fffa 60%, #fff0 60%);
+      border: 2px solid #333; display:grid; place-items:center; z-index:1000;
+    }
+    .bearingArrow svg { width:36px; height:36px; transform: rotate(0deg); transition: transform .1s linear; }
+    .pill { display:inline-flex; gap:6px; align-items:center; }
+    .colorDot { width:12px; height:12px; border-radius:50%; display:inline-block; border:1px solid #000; }
+    .panel {
+      position: fixed; right:10px; top:10px; z-index:1000;
+      display:flex; flex-direction:column; gap:8px; width:min(380px, calc(100vw - 20px));
+    }
+    textarea { width:100%; min-height:70px; background:#0b0b0b; color:#dcdcdc; border:1px solid #444; border-radius:10px; padding:8px; }
+    .small { font: 600 12px system-ui, sans-serif; color:#bbb; }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <!-- left stack -->
+  <div class="hud">
+    <button id="gps" class="btn" title="Center on your GPS">📍 GPS</button>
+
+    <div class="row">
+      <button id="mode-blood" class="btn" aria-pressed="false">🩸 Blood</button>
+      <button id="mode-track" class="btn" aria-pressed="false">👣 Track</button>
+      <button id="mode-bed"   class="btn" aria-pressed="false">🛏️ Bed</button>
+      <button id="mode-last"  class="btn" aria-pressed="false">👀 Last Seen</button>
+      <button id="mode-trail" class="btn" aria-pressed="true">🧵 Draw Trail</button>
+      <button id="undo"       class="btn">↩︎ Undo</button>
+      <button id="clear"      class="btn">🗑 Clear</button>
+    </div>
+
+    <div class="row">
+      <span class="pill">Wind:
+        <span class="colorDot" style="background:#5da9ff"></span>
+        <input id="windDir" class="txt" inputmode="decimal" style="width:80px" placeholder="deg (0-360)">
+      </span>
+      <span class="pill">Notes:
+        <input id="note" class="txt" style="min-width:180px" placeholder="buck crossed creek…">
+      </span>
+    </div>
+  </div>
+
+  <!-- right stack -->
+  <div class="panel">
+    <div class="small">Export / Import (JSON)</div>
+    <textarea id="io" placeholder="Export: click → text fills here.  Import: paste JSON and click Import."></textarea>
+    <div style="display:flex; gap:8px">
+      <button id="export" class="btn" style="flex:1">Export</button>
+      <button id="import" class="btn" style="flex:1">Import</button>
+      <button id="save"   class="btn" style="flex:1">Save</button>
+    </div>
+  </div>
+
+  <div class="stats" id="stats">
+    <div><b>Trail:</b> <span id="len">0.00</span> mi</div>
+    <div><b>Points:</b> <span id="pts">0</span></div>
+  </div>
+
+  <div class="bearingArrow" title="Phone bearing">
+    <svg viewBox="0 0 24 24" id="arrow">
+      <path d="M12 2 L15 22 L12 18 L9 22 Z" fill="#d11"/>
+    </svg>
+  </div>
+
+  <script>
+    /* ------------------ Map base ------------------ */
+    const map = L.map('map', {zoomControl: false}).setView([37.1,-95.7], 5);
+    L.control.zoom({position:'topright'}).addTo(map);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 20,
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    /* ------------------ State ------------------ */
+    const state = {
+      mode: 'trail',           // 'blood' | 'track' | 'bed' | 'last' | 'trail'
+      markers: [],             // {id,type,lat,lng,color,leaf}
+      trail: [],               // latlngs
+      wind: null,              // degrees
+      note: ''
+    };
+
+    const colors = {
+      blood: '#d11',
+      track: '#ffcc00',
+      bed:   '#8e44ad',
+      last:  '#1abc9c'
+    };
+
+    const markerIcon = (hex) => L.divIcon({
+      className: 'mk',
+      html: `<div style="
+        width:16px;height:16px;border-radius:50%;
+        background:${hex};border:2px solid #000; box-shadow:0 0 0 1px #fff8;
+      "></div>`,
+      iconSize: [16,16], iconAnchor: [8,8]
+    });
+
+    const poly = L.polyline([], {color:'#fff', weight:4, opacity:0.9}).addTo(map);
+
+    /* ------------------ Helpers ------------------ */
+    const haversine = (a, b) => {
+      const toRad = d => d*Math.PI/180;
+      const R = 6371000;
+      const dLat = toRad(b.lat-a.lat), dLng = toRad(b.lng-a.lng);
+      const s = Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLng/2)**2;
+      return 2*R*Math.asin(Math.sqrt(s)); // meters
+    };
+    const trailDistanceMeters = () => {
+      let d=0; for (let i=1;i<state.trail.length;i++) d += haversine(state.trail[i-1], state.trail[i]);
+      return d;
+    };
+    const updateStats = () => {
+      document.getElementById('pts').textContent = state.trail.length;
+      document.getElementById('len').textContent = (trailDistanceMeters()/1609.344).toFixed(2);
+    };
+    const persist = () => localStorage.setItem('bf_bloodtrail', JSON.stringify({
+      markers: state.markers.map(m => ({id:m.id, type:m.type, lat:m.lat, lng:m.lng, color:m.color})),
+      trail: state.trail,
+      wind: state.wind,
+      note: state.note
+    }));
+    const restore = () => {
+      try {
+        const raw = localStorage.getItem('bf_bloodtrail'); if (!raw) return;
+        const data = JSON.parse(raw);
+        (data.markers||[]).forEach(m => addMarker(m.type, L.latLng(m.lat,m.lng), m.color, m.id));
+        (data.trail||[]).forEach(ll => addTrailPoint(L.latLng(ll.lat,ll.lng)));
+        if (typeof data.wind === 'number') windDir.value = data.wind;
+        if (data.note) note.value = data.note;
+      } catch(e) {}
+    };
+
+    /* ------------------ Actions ------------------ */
+    function setMode(m){
+      state.mode = m;
+      // visual toggles
+      ['blood','track','bed','last','trail'].forEach(id=>{
+        const el = document.getElementById('mode-'+id);
+        if (el) el.setAttribute('aria-pressed', id===m ? 'true':'false');
+      });
+    }
+
+    function addMarker(type, latlng, color=colors[type], existingId=null){
+      const id = existingId || (Date.now()+'_'+Math.random().toString(36).slice(2,7));
+      const mk = L.marker(latlng, {icon: markerIcon(color), draggable:true}).addTo(map);
+      mk.on('dragend', ()=> {
+        const r = state.markers.find(x=>x.id===id);
+        if (r){ const ll = mk.getLatLng(); r.lat = ll.lat; r.lng = ll.lng; persist(); }
+      });
+      mk.bindTooltip(type.toUpperCase(), {permanent:false, direction:'top', offset:[0,-8]});
+      state.markers.push({id:type+'_'+id, type, lat:latlng.lat, lng:latlng.lng, color, leaf:mk});
+      persist();
+    }
+
+    function addTrailPoint(latlng){
+      state.trail.push({lat:latlng.lat, lng:latlng.lng});
+      poly.addLatLng(latlng);
+      updateStats(); persist();
+    }
+
+    function undo(){
+      if (state.mode==='trail' && state.trail.length){
+        state.trail.pop(); poly.setLatLngs(state.trail); updateStats(); persist(); return;
+      }
+      if (state.markers.length){
+        const last = state.markers.pop();
+        if (last.leaf){ map.removeLayer(last.leaf); }
+        persist();
+      }
+    }
+
+    function clearAll(){
+      state.trail = []; poly.setLatLngs([]);
+      state.markers.forEach(m=>map.removeLayer(m.leaf)); state.markers = [];
+      updateStats(); persist();
+    }
+
+    /* ------------------ Map events ------------------ */
+    map.on('click', (e)=>{
+      if (state.mode==='trail'){ addTrailPoint(e.latlng); return; }
+      if (['blood','track','bed','last'].includes(state.mode)){ addMarker(state.mode, e.latlng); }
+    });
+
+    /* ------------------ UI wiring ------------------ */
+    // Mode buttons
+    ['blood','track','bed','last','trail'].forEach(id=>{
+      document.getElementById('mode-'+id).addEventListener('click', ()=>setMode(id));
+    });
+
+    document.getElementById('undo').onclick = undo;
+    document.getElementById('clear').onclick = ()=>{
+      if (confirm('Clear trail & pins?')) clearAll();
+    };
+
+    // GPS
+    document.getElementById('gps').onclick = ()=>{
+      map.locate({setView:true, enableHighAccuracy:true, maxZoom:18});
+    };
+
+    // Wind / Notes
+    const windDir = document.getElementById('windDir');
+    const note = document.getElementById('note');
+    windDir.addEventListener('change', ()=>{ const v=parseFloat(windDir.value); if(!isNaN(v)){ state.wind=v; persist(); }});
+    note.addEventListener('change', ()=>{ state.note = note.value; persist(); });
+
+    // Export / Import / Save
+    const io = document.getElementById('io');
+    document.getElementById('export').onclick = ()=>{
+      io.value = localStorage.getItem('bf_bloodtrail') || '';
+      io.focus(); io.select();
+    };
+    document.getElementById('import').onclick = ()=>{
+      try{
+        localStorage.setItem('bf_bloodtrail', io.value);
+        clearAll(); restore(); alert('Imported!');
+      }catch(e){ alert('Bad JSON'); }
+    };
+    document.getElementById('save').onclick = ()=>{ persist(); alert('Saved to this device'); };
+
+    // Phone bearing arrow
+    const arrow = document.getElementById('arrow');
+    window.addEventListener('deviceorientationabsolute', (ev)=>{
+      if (ev.alpha != null){
+        arrow.style.transform = `rotate(${ev.alpha}deg)`;
+      }
+    });
+    window.addEventListener('deviceorientation', (ev)=>{
+      if (ev.alpha != null){
+        arrow.style.transform = `rotate(${ev.alpha}deg)`;
+      }
+    });
+
+    // Start
+    setMode('trail');
+    restore();
+    updateStats();
+  </script>
+</body>
+</html>
